@@ -675,6 +675,106 @@ class TestFeatureDaemon(TestCase):
                 # Verify the feature state was not enabled in the cache
                 assert feature_handler._cached_config[feature.name].state != 'enabled'
 
+    def test_enable_feature_stops_service_when_start_fails(self, mock_syslog, get_runtime):
+        """When `systemctl start <feature>.service` fails, featured must follow up
+        with `systemctl stop` so partially-started state (e.g. a docker container
+        spawned by ExecStartPre) does not get left behind holding kernel resources.
+
+        This guards against the regression tracked in redmine #4958612, where WJH
+        kept holding sx_core RDQs after a failed start, causing the next syncd
+        init to hit an SDK watchdog.
+        """
+        mock_db = mock.MagicMock()
+        mock_feature_state_table = mock.MagicMock()
+        device_cfg = {"DEVICE_METADATA": {"localhost": {"type": "FixedSwitch"}}}
+
+        feature_handler = featured.FeatureHandler(mock_db, mock_feature_state_table,
+                                                  device_cfg, False)
+
+        feature = featured.Feature('what-just-happened', {
+            'state': 'enabled',
+            'auto_restart': 'enabled',
+        }, device_cfg)
+
+        # Only the `systemctl start` call should fail; `unmask`/`enable`/`stop`
+        # must complete normally.
+        def run_cmd_side_effect(cmd, **_kwargs):
+            if len(cmd) >= 3 and cmd[2] == "start":
+                raise Exception("systemctl start failed")
+            return None
+
+        with mock.patch.object(feature_handler, "get_multiasic_feature_instances",
+                               return_value=(["what-just-happened"], ["service"])), \
+             mock.patch.object(feature_handler, "get_systemd_unit_state",
+                               return_value="disabled"), \
+             mock.patch("featured.run_cmd",
+                        side_effect=run_cmd_side_effect) as mocked_run_cmd:
+
+            result = feature_handler.enable_feature(feature)
+
+            assert result is False
+
+            # The cleanup `systemctl stop` must be issued for the same feature
+            # whose start failed.
+            stop_call = mock.call(
+                ["sudo", "systemctl", "stop", "what-just-happened.service"],
+                log_err=False, raise_exception=False,
+            )
+            assert stop_call in mocked_run_cmd.call_args_list, \
+                "Expected `systemctl stop what-just-happened.service` cleanup " \
+                "after a failed start, got calls: {}".format(mocked_run_cmd.call_args_list)
+
+        # Feature must end up in FAILED state.
+        mock_feature_state_table.set.assert_any_call(
+            'what-just-happened', [('state', 'failed')])
+
+    def test_enable_feature_does_not_run_cleanup_when_enable_fails(self, mock_syslog, get_runtime):
+        """`systemctl enable` failures must NOT trigger a `systemctl stop` follow-up:
+        nothing was started yet, so there is nothing to clean up, and an unnecessary
+        stop could mask actual configuration problems.
+        """
+        mock_db = mock.MagicMock()
+        mock_feature_state_table = mock.MagicMock()
+        device_cfg = {"DEVICE_METADATA": {"localhost": {"type": "FixedSwitch"}}}
+
+        feature_handler = featured.FeatureHandler(mock_db, mock_feature_state_table,
+                                                  device_cfg, False)
+
+        feature = featured.Feature('what-just-happened', {
+            'state': 'enabled',
+            'auto_restart': 'enabled',
+        }, device_cfg)
+
+        # `enable` is run with raise_exception=False so this side-effect must mimic that
+        # path: ensure no exception is raised and only the path we care about (a real
+        # start failure happening downstream) is tested elsewhere. Here we make the
+        # `enable` line itself raise to confirm that the cleanup heuristic only fires
+        # on the `start` command word.
+        def run_cmd_side_effect(cmd, **_kwargs):
+            if len(cmd) >= 3 and cmd[2] == "enable":
+                raise Exception("systemctl enable failed")
+            return None
+
+        with mock.patch.object(feature_handler, "get_multiasic_feature_instances",
+                               return_value=(["what-just-happened"], ["service"])), \
+             mock.patch.object(feature_handler, "get_systemd_unit_state",
+                               return_value="disabled"), \
+             mock.patch("featured.run_cmd",
+                        side_effect=run_cmd_side_effect) as mocked_run_cmd:
+
+            # `enable` is run with raise_exception=False inside enable_feature, so the
+            # function returns True; the important assertion is that no stop command
+            # was issued.
+            feature_handler.enable_feature(feature)
+
+            stop_calls = [
+                c for c in mocked_run_cmd.call_args_list
+                if len(c.args) >= 1 and len(c.args[0]) >= 3 and c.args[0][2] == "stop"
+            ]
+            assert stop_calls == [], \
+                "Did not expect a `systemctl stop` cleanup when only `enable` failed, " \
+                "but got: {}".format(stop_calls)
+
 
 class TestWaitForServiceStable(TestCase):
     """Tests for wait_for_service_stable method that prevents orphaned containers."""

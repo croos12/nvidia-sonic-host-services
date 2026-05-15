@@ -507,6 +507,17 @@ class FeatureHandler(object):
                 except Exception as err:
                     syslog.syslog(syslog.LOG_ERR, "Feature '{}.{}' failed to be enabled and started"
                                   .format(feature.name, feature_suffixes[-1]))
+                    # If `systemctl start` failed, follow up with `systemctl stop` so any
+                    # partially-started state (e.g. a docker container that was launched by
+                    # ExecStartPre before the start command failed) is torn down instead of
+                    # being left holding kernel resources. This is what causes WJH to keep
+                    # holding sx_core RDQs across syncd restarts; see redmine #4958612.
+                    if len(cmd) >= 3 and cmd[2] == "start":
+                        cleanup_cmd = ["sudo", "systemctl", "stop",
+                                       "{}.{}".format(feature_name, feature_suffixes[-1])]
+                        syslog.syslog(syslog.LOG_INFO,
+                                      "Running cleanup after failed start: '{}'".format(cleanup_cmd))
+                        run_cmd(cleanup_cmd, log_err=False, raise_exception=False)
                     self.set_feature_state(feature, self.FEATURE_STATE_FAILED)
                     return False
 
